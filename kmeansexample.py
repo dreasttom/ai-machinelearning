@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plot
 import seaborn as seab 
-
+#you will need https://www.kaggle.com/datasets/rabieelkharoua/alzheimers-disease-dataset
 import os
 import warnings
 
