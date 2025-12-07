@@ -33,7 +33,7 @@ except Exception as e:
 # -------------------------------------------------------
 print("Preview of the loaded data:")
 print(df.head())
-
+print(df.describe())
 # -------------------------------------------------------
 # Warn the user about missing values (NaN)
 # -------------------------------------------------------
