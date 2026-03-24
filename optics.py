@@ -1,721 +1,732 @@
+#!/usr/bin/env python3
 """
-OPTICS (Ordering Points To Identify the Clustering Structure)
--------------------------------------------------------------
+optics_radar_clustering.py
 
-Educational implementation of the OPTICS clustering algorithm using
-the "naturalgasbyzip.csv" dataset (or another user-provided CSV).
+A standalone script that implements the OPTICS clustering algorithm from scratch
+and applies it to a CSV file located in the same folder as this script.
 
-This script:
-    - Loads a CSV file.
-    - Lets the user choose numeric feature columns interactively
-      (or via command-line arguments).
-    - Prompts for / accepts eps and MinPts parameters.
-    - Runs OPTICS (implemented from scratch).
-    - Produces a reachability plot.
+Designed for robust, practical use with datasets like radar readings.
 
-The code is heavily commented for students and includes robust error handling.
+Key features:
+- Reads CSV data from the same directory as the script
+- Automatically selects numeric columns for clustering
+- Handles missing values, invalid parameters, and common file issues
+- Normalizes numeric features before clustering
+- Computes core distances and reachability distances
+- Produces an OPTICS ordering
+- Extracts simple clusters using a DBSCAN-style epsilon cut over OPTICS results
+- Writes output with cluster assignments to a new CSV file
+- Includes extensive comments for learning and maintenance
+
+IMPORTANT:
+This script implements OPTICS directly and does not depend on scikit-learn's OPTICS.
+
+Usage examples:
+    python optics_radar_clustering.py
+    python optics_radar_clustering.py --input test_military_radar_readings.csv
+    python optics_radar_clustering.py --input test_military_radar_readings.csv --min-samples 8 --max-eps 3.0 --cluster-eps 1.2
+
+Default assumptions:
+- The input file is named "test_military_radar_readings.csv"
+- The input file is in the same folder as this script
 """
 
+from __future__ import annotations
+
+import argparse
+import heapq
+import math
 import os
 import sys
-import math
-import heapq      # For the priority queue used in the algorithm
-import argparse   # For command-line argument parsing
-
-from typing import Tuple, List
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 
-# ----------------------------------------------------------------------
-# 1. DATA LOADING AND PREPARATION
-# ----------------------------------------------------------------------
+# =============================================================================
+# Custom exception types
+# =============================================================================
 
-def load_dataset(
-    file_path: str,
-    feature_columns: List[str] = None
-) -> Tuple[np.ndarray, pd.DataFrame]:
+class OpticsError(Exception):
+    """Base exception for OPTICS-related failures."""
+    pass
+
+
+class DataValidationError(OpticsError):
+    """Raised when the input data cannot be used for clustering."""
+    pass
+
+
+class ParameterValidationError(OpticsError):
+    """Raised when user parameters are invalid."""
+    pass
+
+
+# =============================================================================
+# Data structures
+# =============================================================================
+
+@dataclass
+class OpticsResult:
     """
-    Load the dataset from CSV and return a NumPy feature matrix.
+    Stores the main outputs of the OPTICS algorithm.
 
-    Parameters
-    ----------
-    file_path : str
-        Path to the CSV file.
-    feature_columns : list of str, optional
-        List of column names to use as features. If None, all numeric
-        columns will be used.
-
-    Returns
-    -------
-    X : np.ndarray
-        Feature matrix of shape (n_samples, n_features).
-    df : pd.DataFrame
-        Original DataFrame (for reference / debugging).
-
-    Raises
-    ------
-    FileNotFoundError
-        If the CSV file is not found.
-    ValueError
-        If no usable numeric columns are found or data is invalid.
+    Attributes:
+        ordering:
+            The order in which points were processed by OPTICS.
+        reachability:
+            Reachability distance for each point.
+            Unreachable points remain np.inf.
+        core_distance:
+            Core distance for each point.
+            Undefined core distances remain np.inf.
+        predecessor:
+            Index of the predecessor point that last updated the reachability,
+            or -1 if none exists.
     """
+    ordering: List[int]
+    reachability: np.ndarray
+    core_distance: np.ndarray
+    predecessor: np.ndarray
 
-    # Check if the file exists before attempting to load
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"CSV file not found at path: {file_path}")
+
+# =============================================================================
+# Utility functions
+# =============================================================================
+
+def parse_arguments() -> argparse.Namespace:
+    """Parse command-line arguments with helpful descriptions."""
+    parser = argparse.ArgumentParser(
+        description="Run a from-scratch OPTICS clustering implementation on a CSV file."
+    )
+
+    parser.add_argument(
+        "--input",
+        type=str,
+        default="test_military_radar_readings.csv",
+        help="Name of the CSV file in the same folder as this script."
+    )
+
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="optics_clustered_output.csv",
+        help="Output CSV filename to write results to, in the same folder."
+    )
+
+    parser.add_argument(
+        "--min-samples",
+        type=int,
+        default=5,
+        help="Minimum number of samples required for a core point."
+    )
+
+    parser.add_argument(
+        "--max-eps",
+        type=float,
+        default=np.inf,
+        help="Maximum neighborhood radius considered by OPTICS. Use a positive number, or omit for infinity."
+    )
+
+    parser.add_argument(
+        "--cluster-eps",
+        type=float,
+        default=1.5,
+        help=(
+            "Epsilon used AFTER OPTICS ordering to extract simple DBSCAN-style clusters "
+            "from reachability/core distances."
+        )
+    )
+
+    parser.add_argument(
+        "--drop-na",
+        action="store_true",
+        help=(
+            "Drop rows with missing numeric values. "
+            "If not provided, missing numeric values are imputed with the median."
+        )
+    )
+
+    return parser.parse_args()
+
+
+def validate_parameters(min_samples: int, max_eps: float, cluster_eps: float) -> None:
+    """Validate user-provided clustering parameters."""
+    if min_samples < 2:
+        raise ParameterValidationError("--min-samples must be at least 2.")
+
+    if not (math.isinf(max_eps) or max_eps > 0):
+        raise ParameterValidationError("--max-eps must be positive or omitted.")
+
+    if cluster_eps <= 0:
+        raise ParameterValidationError("--cluster-eps must be > 0.")
+
+
+def resolve_file_path(filename: str) -> Path:
+    """
+    Resolve a file path relative to the script location.
+
+    This makes the script robust even if the user runs it from another working
+    directory. The script always looks in its own folder first.
+    """
+    script_dir = Path(__file__).resolve().parent
+    file_path = script_dir / filename
+    return file_path
+
+
+def load_csv_file(file_path: Path) -> pd.DataFrame:
+    """
+    Load the CSV file with robust error handling.
+    """
+    if not file_path.exists():
+        raise FileNotFoundError(
+            f"Input file not found: {file_path}\n"
+            f"Make sure the CSV is in the same folder as this script."
+        )
+
+    if not file_path.is_file():
+        raise FileNotFoundError(f"Path exists but is not a file: {file_path}")
 
     try:
         df = pd.read_csv(file_path)
-    except pd.errors.EmptyDataError as e:
-        raise ValueError(f"CSV file is empty: {e}")
-    except pd.errors.ParserError as e:
-        raise ValueError(f"Error parsing CSV file: {e}")
-    except Exception as e:
-        raise ValueError(f"Unexpected error reading CSV: {e}")
+    except pd.errors.EmptyDataError as exc:
+        raise DataValidationError(f"The file is empty: {file_path}") from exc
+    except pd.errors.ParserError as exc:
+        raise DataValidationError(
+            f"Could not parse the CSV file: {file_path}\n"
+            f"Please verify that it is a valid comma-separated file."
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise DataValidationError(
+            f"The file could not be decoded as text: {file_path}"
+        ) from exc
+    except Exception as exc:
+        raise OpticsError(f"Unexpected error while reading CSV: {exc}") from exc
 
     if df.empty:
-        raise ValueError("Loaded DataFrame is empty; no data to cluster.")
+        raise DataValidationError("The CSV file contains no rows.")
 
-    # If the user did not specify feature columns, use all numeric columns
-    if feature_columns is None:
-        numeric_df = df.select_dtypes(include=[np.number])
-        if numeric_df.shape[1] == 0:
-            raise ValueError(
-                "No numeric columns found in dataset; cannot perform clustering."
+    return df
+
+
+def prepare_numeric_features(df: pd.DataFrame, drop_na: bool) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    """
+    Select and clean numeric columns for clustering.
+
+    Returns:
+        original_aligned_df:
+            Original dataframe aligned to the rows used in clustering.
+        numeric_df:
+            Numeric-only dataframe used for clustering.
+        numeric_columns:
+            Names of the selected numeric columns.
+
+    Notes:
+    - Non-numeric columns are ignored automatically.
+    - Missing numeric values are either dropped or median-imputed.
+    """
+    numeric_df = df.select_dtypes(include=[np.number]).copy()
+
+    if numeric_df.empty:
+        raise DataValidationError(
+            "No numeric columns were found. OPTICS requires numeric features."
+        )
+
+    numeric_columns = numeric_df.columns.tolist()
+
+    # Replace positive/negative infinity with NaN so missing-data handling
+    # can process them consistently.
+    numeric_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    if drop_na:
+        valid_mask = ~numeric_df.isna().any(axis=1)
+        numeric_df = numeric_df.loc[valid_mask].copy()
+        original_aligned_df = df.loc[valid_mask].copy()
+
+        if numeric_df.empty:
+            raise DataValidationError(
+                "All rows were removed after dropping missing numeric values."
             )
-        feature_columns = list(numeric_df.columns)
     else:
-        # Validate that requested columns exist
-        missing_cols = [c for c in feature_columns if c not in df.columns]
-        if missing_cols:
-            raise ValueError(
-                f"The following requested feature columns are missing: {missing_cols}"
-            )
+        # Median imputation is often a reasonable, stable default for numeric data.
+        for col in numeric_columns:
+            if numeric_df[col].isna().all():
+                raise DataValidationError(
+                    f"Numeric column '{col}' contains only missing values."
+                )
+            median_value = numeric_df[col].median()
+            numeric_df[col] = numeric_df[col].fillna(median_value)
 
-        # Select only numeric columns among the requested ones
-        non_numeric = [
-            c for c in feature_columns
-            if not np.issubdtype(df[c].dtype, np.number)
-        ]
-        if non_numeric:
-            raise ValueError(
-                f"The following requested feature columns are not numeric: {non_numeric}"
-            )
+        original_aligned_df = df.copy()
 
-        numeric_df = df[feature_columns]
+    if len(numeric_df) < 2:
+        raise DataValidationError("At least 2 usable rows are required for clustering.")
 
-    # Handle missing values: simple imputation by column mean
-    X = numeric_df.copy()
-    X = X.fillna(X.mean(numeric_only=True))
-
-    if X.isnull().any().any():
-        # If still NaNs after imputation, fail early
-        raise ValueError("NaN values remain after imputation; check data.")
-
-    X_values = X.to_numpy(dtype=float)
-
-    if X_values.shape[0] < 2:
-        raise ValueError("Need at least 2 data points to run OPTICS.")
-
-    return X_values, df
+    return original_aligned_df, numeric_df, numeric_columns
 
 
-# ----------------------------------------------------------------------
-# 2. CORE OPTICS IMPLEMENTATION
-# ----------------------------------------------------------------------
-
-def compute_distance_matrix(X: np.ndarray) -> np.ndarray:
+def standardize_features(numeric_df: pd.DataFrame) -> np.ndarray:
     """
-    Compute the pairwise Euclidean distance matrix for a dataset X.
+    Standardize features to zero mean and unit variance.
 
-    Parameters
-    ----------
-    X : np.ndarray
-        Feature matrix of shape (n_samples, n_features).
+    Why this matters:
+    OPTICS relies on distances. If one feature has a much larger scale than
+    another, it can dominate the distance computation and distort clusters.
 
-    Returns
-    -------
-    distances : np.ndarray
-        Pairwise distance matrix of shape (n_samples, n_samples).
+    Zero-variance columns are handled safely by replacing std=0 with std=1.
     """
-    # Broadcasting: (n,1,d) - (1,n,d) -> (n,n,d) then square, sum, sqrt
-    diff = X[:, np.newaxis, :] - X[np.newaxis, :, :]
-    distances = np.sqrt(np.sum(diff ** 2, axis=2))
-    return distances
+    X = numeric_df.to_numpy(dtype=float)
+
+    means = np.mean(X, axis=0)
+    stds = np.std(X, axis=0)
+
+    # Avoid division by zero for constant-value columns.
+    stds_safe = np.where(stds == 0, 1.0, stds)
+
+    X_scaled = (X - means) / stds_safe
+
+    if not np.isfinite(X_scaled).all():
+        raise DataValidationError(
+            "Scaled feature matrix contains invalid values after preprocessing."
+        )
+
+    return X_scaled
 
 
-def neighbors(dist_matrix: np.ndarray, idx: int, eps: float) -> np.ndarray:
+def pairwise_distances(X: np.ndarray) -> np.ndarray:
     """
-    Find indices of all points within distance eps of point idx.
+    Compute a full pairwise Euclidean distance matrix.
 
-    Parameters
-    ----------
-    dist_matrix : np.ndarray
-        Precomputed distance matrix (n_samples, n_samples).
-    idx : int
-        Index of the reference point.
-    eps : float
-        Neighborhood radius.
-
-    Returns
-    -------
-    np.ndarray
-        Array of neighbor indices (including idx itself).
+    This implementation is simple and clear, which is useful for educational
+    purposes and moderate-sized datasets. For very large datasets, a more
+    memory-efficient neighborhood search structure would be preferable.
     """
-    return np.where(dist_matrix[idx] <= eps)[0]
+    n_samples = X.shape[0]
+
+    if n_samples == 0:
+        raise DataValidationError("Cannot compute distances on an empty dataset.")
+
+    # Broadcasting-based computation of pairwise Euclidean distances.
+    # Shape evolution:
+    # X[:, None, :] -> (n, 1, d)
+    # X[None, :, :] -> (1, n, d)
+    # Difference -> (n, n, d)
+    diff = X[:, None, :] - X[None, :, :]
+    dist_matrix = np.sqrt(np.sum(diff ** 2, axis=2))
+
+    if dist_matrix.shape != (n_samples, n_samples):
+        raise OpticsError("Unexpected shape encountered in distance matrix.")
+
+    return dist_matrix
+
+
+# =============================================================================
+# OPTICS implementation
+# =============================================================================
+
+def get_neighbors(dist_matrix: np.ndarray, point_idx: int, max_eps: float) -> List[int]:
+    """
+    Return indices of all points within max_eps of point_idx, including itself.
+
+    OPTICS commonly includes the point itself in the neighborhood when counting
+    min_samples for core-distance determination.
+    """
+    distances = dist_matrix[point_idx]
+    if math.isinf(max_eps):
+        return list(np.arange(len(distances)))
+    return list(np.where(distances <= max_eps)[0])
 
 
 def compute_core_distance(
     dist_matrix: np.ndarray,
-    idx: int,
-    eps: float,
-    min_pts: int
+    point_idx: int,
+    neighbors: List[int],
+    min_samples: int
 ) -> float:
     """
-    Compute the core-distance for a point.
+    Compute the core distance of a point.
 
-    Definition (simplified):
-        - Let N_eps(p) be the set of neighbors within radius eps (including p).
-        - If |N_eps(p)| < min_pts, core-distance is undefined (NaN).
-        - Else, core-distance = distance to the min_pts-th nearest neighbor.
+    Definition:
+    The core distance of a point is the distance from that point to its
+    min_samples-th nearest neighbor (counting the point itself if included).
 
-    Parameters
-    ----------
-    dist_matrix : np.ndarray
-        Precomputed distance matrix.
-    idx : int
-        Index of the point p.
-    eps : float
-        Neighborhood radius.
-    min_pts : int
-        Minimum number of points to be a core point.
-
-    Returns
-    -------
-    float
-        Core-distance value, or NaN if undefined.
+    If there are fewer than min_samples points in its neighborhood, the core
+    distance is undefined, and we represent it as np.inf.
     """
-    # Get the distances from point idx to all others
-    distances = dist_matrix[idx]
+    if len(neighbors) < min_samples:
+        return np.inf
 
-    # Only neighbors within eps are considered
-    # (including the point itself at distance 0)
-    neigh_mask = distances <= eps
-    neigh_distances = distances[neigh_mask]
+    neighbor_distances = np.sort(dist_matrix[point_idx, neighbors])
 
-    if len(neigh_distances) < min_pts:
-        # Not enough neighbors -> not a core point
-        return math.nan
-
-    # Sort neighbor distances and take the min_pts-th smallest
-    sorted_distances = np.sort(neigh_distances)
-    core_dist = float(sorted_distances[min_pts - 1])
-
-    return core_dist
+    # Since neighbors includes the point itself at distance 0,
+    # the min_samples-th neighbor is index min_samples - 1.
+    core_dist = neighbor_distances[min_samples - 1]
+    return float(core_dist)
 
 
 def update_seeds(
-    dist_matrix: np.ndarray,
     point_idx: int,
-    neighbors_idx: np.ndarray,
-    core_distances: np.ndarray,
-    reachability_distances: np.ndarray,
+    neighbors: List[int],
     processed: np.ndarray,
-    order_seeds: List[Tuple[float, int]]
+    reachability: np.ndarray,
+    predecessor: np.ndarray,
+    seeds: List[Tuple[float, int]],
+    dist_matrix: np.ndarray,
+    core_distance: np.ndarray
 ) -> None:
     """
-    Update the reachability distance of neighbors of a core point
-    and push them into the priority queue (order_seeds).
+    Update reachability distances of unprocessed neighbors.
 
-    Parameters
-    ----------
-    dist_matrix : np.ndarray
-        Precomputed distance matrix.
-    point_idx : int
-        Index of the core point p.
-    neighbors_idx : np.ndarray
-        Indices of neighbors of p.
-    core_distances : np.ndarray
-        Array of core distances for all points.
-    reachability_distances : np.ndarray
-        Array of reachability distances for all points (NaN = undefined).
-    processed : np.ndarray
-        Boolean array indicating whether each point has been processed.
-    order_seeds : list of (float, int)
-        Min-heap (priority queue) of seeds; elements are (reachability_distance, index).
+    For each unprocessed neighbor o of point p:
+        new_reachability = max(core_distance(p), distance(p, o))
+
+    If this improves the neighbor's current reachability value,
+    update it and push it into the priority queue.
+
+    Notes:
+    - We allow duplicate entries in the heap for simplicity.
+    - When popping from the heap later, we skip already-processed points.
+    - This is a standard practical approach and keeps the code simpler.
     """
-    for o in neighbors_idx:
-        if processed[o]:
-            # Already processed; skip
+    p_core = core_distance[point_idx]
+    if not np.isfinite(p_core):
+        return
+
+    for neighbor_idx in neighbors:
+        if processed[neighbor_idx]:
             continue
 
-        # Reachability distance defined as:
-        #    reachability(o) = max(core_distance(p), distance(p, o))
-        new_reach_dist = max(core_distances[point_idx], dist_matrix[point_idx, o])
+        new_reachability = max(p_core, dist_matrix[point_idx, neighbor_idx])
 
-        if math.isnan(reachability_distances[o]):
-            # No reachability distance yet -> set it
-            reachability_distances[o] = new_reach_dist
-            heapq.heappush(order_seeds, (new_reach_dist, o))
-        else:
-            # Only update if we found a smaller (better) reachability distance
-            if new_reach_dist < reachability_distances[o]:
-                reachability_distances[o] = new_reach_dist
-                # We push again; duplicates with larger keys will be ignored
-                # when popped because 'processed' will be True by then.
-                heapq.heappush(order_seeds, (new_reach_dist, o))
+        if new_reachability < reachability[neighbor_idx]:
+            reachability[neighbor_idx] = new_reachability
+            predecessor[neighbor_idx] = point_idx
+            heapq.heappush(seeds, (new_reachability, neighbor_idx))
 
 
 def optics(
     X: np.ndarray,
-    eps: float,
-    min_pts: int
-) -> Tuple[List[int], np.ndarray, np.ndarray]:
+    min_samples: int = 5,
+    max_eps: float = np.inf
+) -> OpticsResult:
     """
-    Run the OPTICS clustering algorithm on a feature matrix X.
+    Run the OPTICS algorithm on a numeric feature matrix.
 
-    Note:
-        - This implementation focuses on computing the ordering and reachability
-          distances. It does NOT extract clusters; instead you can interpret
-          the reachability plot manually or implement a separate extraction step.
+    Parameters:
+        X:
+            2D numeric array of shape (n_samples, n_features)
+        min_samples:
+            Minimum number of samples for a point to be considered core
+        max_eps:
+            Maximum radius for neighborhood queries
 
-    Parameters
-    ----------
-    X : np.ndarray
-        Feature matrix of shape (n_samples, n_features).
-    eps : float
-        Maximum radius for neighborhood queries.
-    min_pts : int
-        Minimum number of points to be considered a core point.
-
-    Returns
-    -------
-    ordering : list of int
-        The order in which points are processed.
-    reachability_distances : np.ndarray
-        Reachability distance for each point (NaN if undefined).
-    core_distances : np.ndarray
-        Core distance for each point (NaN if undefined).
-
-    Raises
-    ------
-    ValueError
-        If parameters are invalid.
+    Returns:
+        OpticsResult containing ordering, reachability, core distances, predecessor
     """
+    if X.ndim != 2:
+        raise DataValidationError("Feature matrix X must be 2-dimensional.")
 
     n_samples = X.shape[0]
 
-    # Basic parameter validation
-    if eps <= 0:
-        raise ValueError("eps must be > 0.")
-    if min_pts < 2:
-        raise ValueError("min_pts should be at least 2.")
-    if min_pts > n_samples:
-        raise ValueError("min_pts cannot be larger than the number of samples.")
-
-    # Precompute distance matrix (O(n^2) memory/time)
-    dist_matrix = compute_distance_matrix(X)
-
-    # Initialize arrays
-    processed = np.zeros(n_samples, dtype=bool)
-    reachability_distances = np.full(n_samples, np.nan)
-    core_distances = np.full(n_samples, np.nan)
-
-    ordering: List[int] = []
-
-    # Loop over all points; expand each unprocessed point
-    for p in range(n_samples):
-        if processed[p]:
-            continue
-
-        # Neighborhood of p
-        N = neighbors(dist_matrix, p, eps)
-
-        processed[p] = True
-        ordering.append(p)
-
-        # Compute core-distance of p
-        core_distances[p] = compute_core_distance(dist_matrix, p, eps, min_pts)
-
-        if math.isnan(core_distances[p]):
-            # Not a core point -> cannot expand cluster from p
-            continue
-
-        # Initialize priority queue (min-heap) of seeds
-        order_seeds: List[Tuple[float, int]] = []
-
-        # Update reachability distances for neighbors
-        update_seeds(
-            dist_matrix,
-            p,
-            N,
-            core_distances,
-            reachability_distances,
-            processed,
-            order_seeds
+    if n_samples < min_samples:
+        raise DataValidationError(
+            f"Dataset has only {n_samples} rows, but min_samples={min_samples}. "
+            "Please reduce min_samples or use more data."
         )
 
-        # Process the seeds in order of increasing reachability distance
-        while order_seeds:
-            # Pop the point with smallest reachability distance
-            _, q = heapq.heappop(order_seeds)
+    dist_matrix = pairwise_distances(X)
 
-            if processed[q]:
-                # Could be a stale entry in the heap; ignore
-                continue
+    processed = np.zeros(n_samples, dtype=bool)
+    reachability = np.full(n_samples, np.inf, dtype=float)
+    core_distance = np.full(n_samples, np.inf, dtype=float)
+    predecessor = np.full(n_samples, -1, dtype=int)
+    ordering: List[int] = []
 
-            Nq = neighbors(dist_matrix, q, eps)
-            processed[q] = True
-            ordering.append(q)
+    # Main OPTICS loop:
+    # Repeatedly expand the next unprocessed point.
+    for point_idx in range(n_samples):
+        if processed[point_idx]:
+            continue
 
-            # Compute core-distance of q
-            core_distances[q] = compute_core_distance(dist_matrix, q, eps, min_pts)
+        neighbors = get_neighbors(dist_matrix, point_idx, max_eps)
+        processed[point_idx] = True
+        ordering.append(point_idx)
 
-            if not math.isnan(core_distances[q]):
-                # If q is a core point, update its neighbors
-                update_seeds(
-                    dist_matrix,
-                    q,
-                    Nq,
-                    core_distances,
-                    reachability_distances,
-                    processed,
-                    order_seeds
+        core_distance[point_idx] = compute_core_distance(
+            dist_matrix=dist_matrix,
+            point_idx=point_idx,
+            neighbors=neighbors,
+            min_samples=min_samples
+        )
+
+        if np.isfinite(core_distance[point_idx]):
+            seeds: List[Tuple[float, int]] = []
+
+            update_seeds(
+                point_idx=point_idx,
+                neighbors=neighbors,
+                processed=processed,
+                reachability=reachability,
+                predecessor=predecessor,
+                seeds=seeds,
+                dist_matrix=dist_matrix,
+                core_distance=core_distance
+            )
+
+            while seeds:
+                _, next_point = heapq.heappop(seeds)
+
+                if processed[next_point]:
+                    continue
+
+                next_neighbors = get_neighbors(dist_matrix, next_point, max_eps)
+                processed[next_point] = True
+                ordering.append(next_point)
+
+                core_distance[next_point] = compute_core_distance(
+                    dist_matrix=dist_matrix,
+                    point_idx=next_point,
+                    neighbors=next_neighbors,
+                    min_samples=min_samples
                 )
 
-    return ordering, reachability_distances, core_distances
+                if np.isfinite(core_distance[next_point]):
+                    update_seeds(
+                        point_idx=next_point,
+                        neighbors=next_neighbors,
+                        processed=processed,
+                        reachability=reachability,
+                        predecessor=predecessor,
+                        seeds=seeds,
+                        dist_matrix=dist_matrix,
+                        core_distance=core_distance
+                    )
+
+    return OpticsResult(
+        ordering=ordering,
+        reachability=reachability,
+        core_distance=core_distance,
+        predecessor=predecessor
+    )
 
 
-# ----------------------------------------------------------------------
-# 3. VISUALIZATION: REACHABILITY PLOT
-# ----------------------------------------------------------------------
+# =============================================================================
+# Cluster extraction
+# =============================================================================
 
-def plot_reachability(
-    ordering: List[int],
-    reachability_distances: np.ndarray,
-    output_path: str = "reachability_plot.png"
-) -> None:
+def extract_clusters_dbscan_style(
+    optics_result: OpticsResult,
+    cluster_eps: float
+) -> np.ndarray:
     """
-    Create a reachability plot using the OPTICS ordering.
+    Extract simple clusters from OPTICS ordering using a DBSCAN-style epsilon cut.
 
-    Parameters
-    ----------
-    ordering : list of int
-        The OPTICS ordering of point indices.
-    reachability_distances : np.ndarray
-        Reachability distances for each point.
-    output_path : str
-        File path where the plot image will be saved.
+    This is a common and easy-to-understand post-processing approach:
+    - Iterate through points in OPTICS order
+    - Start a new cluster when reachability > eps but core_distance <= eps
+    - Add subsequent points while density-connectivity holds
+    - Label points as noise when they are not density-reachable under eps
+
+    Returns:
+        cluster_labels:
+            Array of cluster IDs, with -1 meaning noise
     """
-    # Reorder reachability distances according to the OPTICS ordering
-    ordered_reachability = [
-        reachability_distances[idx] for idx in ordering
-    ]
+    ordering = optics_result.ordering
+    reachability = optics_result.reachability
+    core_distance = optics_result.core_distance
 
-    # Create the figure
-    plt.figure(figsize=(10, 5))
+    n_samples = len(reachability)
+    labels = np.full(n_samples, -1, dtype=int)
 
-    # Plot reachability distance vs. ordering index
-    plt.plot(range(len(ordering)), ordered_reachability, marker='.', linestyle='-')
+    current_cluster_id = -1
 
-    plt.xlabel("Point order (OPTICS ordering)")
-    plt.ylabel("Reachability distance")
-    plt.title("OPTICS Reachability Plot")
+    for point_idx in ordering:
+        r = reachability[point_idx]
+        c = core_distance[point_idx]
 
-    plt.tight_layout()
-
-    # Save figure to disk
-    try:
-        plt.savefig(output_path, dpi=150)
-        print(f"Reachability plot saved to: {output_path}")
-    except Exception as e:
-        print(f"Warning: Could not save plot to '{output_path}': {e}")
-    finally:
-        plt.close()
-
-
-# ----------------------------------------------------------------------
-# 4. INTERACTIVE HELPERS
-# ----------------------------------------------------------------------
-
-def choose_features_interactively(df: pd.DataFrame,
-                                  default_features: List[str] = None) -> List[str]:
-    """
-    Let the user choose numeric feature columns interactively.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        The full dataset.
-    default_features : list of str, optional
-        A suggested default subset of numeric columns. If all of them are
-        present and numeric, the user can accept them by pressing Enter.
-
-    Returns
-    -------
-    feature_columns : list of str
-        The chosen feature column names.
-
-    Raises
-    ------
-    ValueError
-        If no numeric columns are available.
-    """
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-
-    if not numeric_cols:
-        raise ValueError("No numeric columns available in the dataset.")
-
-    print("\nAvailable numeric columns:")
-    for i, col in enumerate(numeric_cols):
-        print(f"  [{i}] {col}")
-
-    # Check if default features are valid (exist and numeric)
-    valid_default = False
-    if default_features is not None:
-        valid_default = all(col in numeric_cols for col in default_features)
-
-    if valid_default:
-        print("\nPress ENTER to use the default features:")
-        print("  " + ", ".join(default_features))
-    else:
-        print("\nPress ENTER to use ALL numeric columns.")
-
-    print("Or enter comma-separated indices (e.g., 0,1,2) to choose specific features.")
-
-    while True:
-        user_input = input("Your choice: ").strip()
-
-        # User pressed Enter
-        if user_input == "":
-            if valid_default:
-                print(f"Using default features: {default_features}")
-                return default_features
+        # If the point is not reachable within cluster_eps,
+        # it may still start a new cluster if it is itself a core point.
+        if r > cluster_eps:
+            if c <= cluster_eps:
+                current_cluster_id += 1
+                labels[point_idx] = current_cluster_id
             else:
-                print(f"Using all numeric columns: {numeric_cols}")
-                return numeric_cols
-
-        # Try to parse comma-separated indices
-        try:
-            indices = [int(x.strip()) for x in user_input.split(",") if x.strip() != ""]
-        except ValueError:
-            print("Invalid input. Please enter comma-separated integer indices or press ENTER.")
-            continue
-
-        if not indices:
-            print("No indices provided. Try again or press ENTER for default.")
-            continue
-
-        # Check index range
-        if any(i < 0 or i >= len(numeric_cols) for i in indices):
-            print("One or more indices are out of range. Please try again.")
-            continue
-
-        chosen = [numeric_cols[i] for i in indices]
-        print(f"Using chosen features: {chosen}")
-        return chosen
-
-
-def prompt_float(prompt_text: str, default: float, min_val: float = None) -> float:
-    """
-    Prompt the user for a float value with a default and optional minimum.
-
-    Parameters
-    ----------
-    prompt_text : str
-        Text to display to the user.
-    default : float
-        Default value if the user presses Enter.
-    min_val : float, optional
-        Minimum allowed value (inclusive). If None, any float is allowed.
-
-    Returns
-    -------
-    value : float
-        The chosen or default float value.
-    """
-    while True:
-        user_input = input(f"{prompt_text} [{default}]: ").strip()
-        if user_input == "":
-            value = default
+                labels[point_idx] = -1
         else:
-            try:
-                value = float(user_input)
-            except ValueError:
-                print("Invalid number. Please try again.")
-                continue
+            # Reachable from the current cluster.
+            labels[point_idx] = current_cluster_id if current_cluster_id >= 0 else -1
 
-        if min_val is not None and value < min_val:
-            print(f"Value must be at least {min_val}. Please try again.")
-            continue
-
-        return value
+    return labels
 
 
-def prompt_int(prompt_text: str, default: int, min_val: int = None) -> int:
+# =============================================================================
+# Reporting / output
+# =============================================================================
+
+def summarize_clusters(labels: np.ndarray) -> str:
     """
-    Prompt the user for an integer value with a default and optional minimum.
-
-    Parameters
-    ----------
-    prompt_text : str
-        Text to display to the user.
-    default : int
-        Default value if the user presses Enter.
-    min_val : int, optional
-        Minimum allowed value (inclusive). If None, any int is allowed.
-
-    Returns
-    -------
-    value : int
-        The chosen or default integer value.
+    Build a readable cluster summary string.
     """
-    while True:
-        user_input = input(f"{prompt_text} [{default}]: ").strip()
-        if user_input == "":
-            value = default
+    unique_labels, counts = np.unique(labels, return_counts=True)
+
+    lines = []
+    for label, count in zip(unique_labels, counts):
+        if label == -1:
+            lines.append(f"Noise points: {count}")
         else:
-            try:
-                value = int(user_input)
-            except ValueError:
-                print("Invalid integer. Please try again.")
-                continue
+            lines.append(f"Cluster {label}: {count} points")
 
-        if min_val is not None and value < min_val:
-            print(f"Value must be at least {min_val}. Please try again.")
-            continue
-
-        return value
+    return "\n".join(lines)
 
 
-# ----------------------------------------------------------------------
-# 5. MAIN SCRIPT ENTRY POINT
-# ----------------------------------------------------------------------
-
-def main():
+def build_output_dataframe(
+    original_df: pd.DataFrame,
+    numeric_columns: List[str],
+    optics_result: OpticsResult,
+    cluster_labels: np.ndarray
+) -> pd.DataFrame:
     """
-    Main function:
-        - Parses command-line arguments.
-        - Loads the dataset.
-        - Lets the user choose feature columns (if not provided).
-        - Lets the user choose eps and MinPts (if not provided).
-        - Runs OPTICS.
-        - Generates a reachability plot.
+    Merge clustering outputs back into a copy of the original data.
     """
+    output_df = original_df.copy()
 
-    parser = argparse.ArgumentParser(
-        description="Educational OPTICS implementation with interactive options."
-    )
-    parser.add_argument(
-        "--csv-path",
-        type=str,
-        default="naturalgasbyzip.csv",
-        help="Path to CSV file (default: naturalgasbyzip.csv)."
-    )
-    parser.add_argument(
-        "--features",
-        type=str,
-        default=None,
-        help="Comma-separated list of numeric feature columns to use. "
-             "If omitted, you will be prompted interactively."
-    )
-    parser.add_argument(
-        "--eps",
-        type=float,
-        default=None,
-        help="Neighborhood radius (eps). If omitted, you will be prompted."
-    )
-    parser.add_argument(
-        "--min-pts",
-        type=int,
-        default=None,
-        help="Minimum number of points for a core point (MinPts). "
-             "If omitted, you will be prompted."
-    )
-    parser.add_argument(
-        "--plot-path",
-        type=str,
-        default="reachability_plot.png",
-        help="Output path for the reachability plot PNG."
-    )
+    output_df["optics_cluster"] = cluster_labels
+    output_df["optics_reachability"] = optics_result.reachability
+    output_df["optics_core_distance"] = optics_result.core_distance
+    output_df["optics_predecessor"] = optics_result.predecessor
 
-    args = parser.parse_args()
+    # Rank indicates the point's position in the OPTICS ordering.
+    rank = np.full(len(output_df), -1, dtype=int)
+    for idx, point_idx in enumerate(optics_result.ordering):
+        rank[point_idx] = idx
+    output_df["optics_order"] = rank
 
-    csv_path = args.csv_path
+    # Optional convenience field so the user can see what features were used.
+    output_df.attrs["numeric_columns_used"] = numeric_columns
 
-    # First, try to load the dataset (this also checks the file)
+    return output_df
+
+
+def save_output_csv(output_df: pd.DataFrame, output_path: Path) -> None:
+    """
+    Save clustering results to CSV with robust error handling.
+    """
     try:
-        # Here feature_columns=None -> uses all numeric columns as a first pass
-        X_initial, df = load_dataset(csv_path, feature_columns=None)
-        print(f"Loaded dataset from '{csv_path}' with shape: {X_initial.shape}")
-    except Exception as e:
-        print(f"Error loading dataset: {e}")
-        sys.exit(1)
+        output_df.to_csv(output_path, index=False)
+    except PermissionError as exc:
+        raise OpticsError(
+            f"Permission denied while writing output file: {output_path}"
+        ) from exc
+    except OSError as exc:
+        raise OpticsError(
+            f"Failed to write output file: {output_path}\n{exc}"
+        ) from exc
+    except Exception as exc:
+        raise OpticsError(
+            f"Unexpected error while saving output file: {exc}"
+        ) from exc
 
-    # Decide feature columns: either from CLI or interactive
-    if args.features is not None:
-        # User provided a comma-separated list of features
-        feature_cols = [col.strip() for col in args.features.split(",") if col.strip()]
 
-        print(f"Using features from command line: {feature_cols}")
-    else:
-        # Interactive feature selection
-        default_features = ["Consumption (therms)", "Consumption (GJ)"]
-        feature_cols = choose_features_interactively(df, default_features=default_features)
+# =============================================================================
+# Main program flow
+# =============================================================================
 
-    # Now load dataset again, this time with the chosen feature columns
+def main() -> int:
+    """
+    Main entry point.
+
+    Returns:
+        0 on success, non-zero on failure.
+    """
     try:
-        X, df = load_dataset(csv_path, feature_columns=feature_cols)
-        print(f"\nFinal feature matrix shape: {X.shape}")
-        print(f"Feature columns: {feature_cols}")
-    except Exception as e:
-        print(f"Error preparing feature matrix with chosen columns: {e}")
-        sys.exit(1)
+        args = parse_arguments()
 
-    # Decide eps and min_pts: either from CLI or interactive
-    # Provide defaults that worked reasonably for the earlier version
-    default_eps = 5000.0
-    default_min_pts = 5
+        validate_parameters(
+            min_samples=args.min_samples,
+            max_eps=args.max_eps,
+            cluster_eps=args.cluster_eps
+        )
 
-    if args.eps is not None:
-        if args.eps <= 0:
-            print("Error: --eps must be > 0.")
-            sys.exit(1)
-        eps = args.eps
-    else:
-        print("\nChoose OPTICS parameter eps (neighborhood radius).")
-        eps = prompt_float("Enter eps", default=default_eps, min_val=1e-9)
+        input_path = resolve_file_path(args.input)
+        output_path = resolve_file_path(args.output)
 
-    if args.min_pts is not None:
-        if args.min_pts < 2:
-            print("Error: --min-pts must be at least 2.")
-            sys.exit(1)
-        min_pts = args.min_pts
-    else:
-        print("\nChoose OPTICS parameter MinPts (minimum number of points for a core point).")
-        min_pts = prompt_int("Enter MinPts", default=default_min_pts, min_val=2)
+        print(f"Loading input file: {input_path}")
+        df = load_csv_file(input_path)
 
-    print(f"\nRunning OPTICS with eps={eps}, MinPts={min_pts} ...")
+        print(f"Loaded {len(df)} rows and {len(df.columns)} columns.")
 
-    # Run the OPTICS algorithm
-    try:
-        ordering, reachability, core_distances = optics(X, eps=eps, min_pts=min_pts)
-    except Exception as e:
-        print(f"Error running OPTICS algorithm: {e}")
-        sys.exit(1)
+        original_aligned_df, numeric_df, numeric_columns = prepare_numeric_features(
+            df=df,
+            drop_na=args.drop_na
+        )
 
-    # Print some basic info about the results
-    print("\nOPTICS completed.")
-    print(f"Number of points processed: {len(ordering)}")
-    print("First 10 points in ordering:", ordering[:10])
-    print("First 10 reachability distances:", reachability[ordering[:10]])
+        print("Numeric columns selected for clustering:")
+        for col in numeric_columns:
+            print(f"  - {col}")
 
-    # Produce reachability plot
-    plot_reachability(ordering, reachability, output_path=args.plot_path)
+        X = standardize_features(numeric_df)
+
+        print(
+            f"Running OPTICS with min_samples={args.min_samples}, "
+            f"max_eps={args.max_eps}, cluster_eps={args.cluster_eps}"
+        )
+
+        optics_result = optics(
+            X=X,
+            min_samples=args.min_samples,
+            max_eps=args.max_eps
+        )
+
+        cluster_labels = extract_clusters_dbscan_style(
+            optics_result=optics_result,
+            cluster_eps=args.cluster_eps
+        )
+
+        output_df = build_output_dataframe(
+            original_df=original_aligned_df,
+            numeric_columns=numeric_columns,
+            optics_result=optics_result,
+            cluster_labels=cluster_labels
+        )
+
+        save_output_csv(output_df, output_path)
+
+        print("\nOPTICS completed successfully.")
+        print("\nCluster summary:")
+        print(summarize_clusters(cluster_labels))
+        print(f"\nResults written to: {output_path}")
+
+        return 0
+
+    except FileNotFoundError as exc:
+        print(f"[FILE ERROR] {exc}", file=sys.stderr)
+        return 1
+
+    except ParameterValidationError as exc:
+        print(f"[PARAMETER ERROR] {exc}", file=sys.stderr)
+        return 2
+
+    except DataValidationError as exc:
+        print(f"[DATA ERROR] {exc}", file=sys.stderr)
+        return 3
+
+    except OpticsError as exc:
+        print(f"[OPTICS ERROR] {exc}", file=sys.stderr)
+        return 4
+
+    except KeyboardInterrupt:
+        print("\n[INTERRUPTED] Execution cancelled by user.", file=sys.stderr)
+        return 130
+
+    except Exception as exc:
+        # Catch-all for unexpected failures so the script exits cleanly
+        # and provides a useful message rather than a raw traceback only.
+        print(f"[UNEXPECTED ERROR] {exc}", file=sys.stderr)
+        return 99
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
