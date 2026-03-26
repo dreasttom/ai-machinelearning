@@ -2,7 +2,7 @@
 """
 Train an Artificial Neural Network (ANN) on a CSV dataset that lives in the
 same folder as this script.
-
+NOTE; THIS REQUIRES TENSORFLOW
 This script is intentionally written to be:
 1. Easy to read
 2. Heavily commented
